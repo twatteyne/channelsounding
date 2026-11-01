@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+menu "Phase-Based Ranging initiator"
+
+config PBR_CALIBRATION_OFFSET_CM
+	int "Calibration offset (cm)"
+	default 0
+	help
+	  Constant offset subtracted from every cs_de distance estimate, in centimetres.
+	  Measure it by placing both boards side by side (~0 m) or at a known
+	  distance: offset = average measured distance - actual distance.
+	  It covers the antenna and RF path delays of the two boards.
+
+config PBR_MEDIAN_WINDOW
+	int "Median filter window size"
+	default 9
+	range 1 32
+	help
+	  Number of consecutive estimates on which the median is computed.
+
+config PBR_MIN_CHANNELS
+	int "Minimum number of usable channels"
+	default 15
+	range 2 75
+	help
+	  Minimum number of CS channels holding at least one good tone
+	  (quality HIGH on both sides) for an antenna path to be passed to
+	  the cs_de library. Below that, the procedure is skipped.
+
+endmenu
+
+source "Kconfig.zephyr"
