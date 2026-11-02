@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/types.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/reboot.h>
@@ -53,6 +54,7 @@ BUILD_ASSERT(false, "Invalid ranging mode");
 	 (BT_RAS_MAX_STEPS_PER_PROCEDURE * BT_RAS_MAX_STEP_DATA_LEN))
 
 #define CHANNEL_INDEX_OFFSET (2)
+#define CS_STEP_MODE_0 (0)
 #define TONE_QI_OK_TONE_COUNT_THRESHOLD (15)
 
 static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
@@ -87,6 +89,43 @@ static struct bt_conn_le_cs_config cs_config;
 
 static uint16_t m_n_iqs[CONFIG_BT_RAS_MAX_ANTENNA_PATHS][CS_DE_NUM_CHANNELS];
 static cs_de_report_t m_cs_de_report;
+
+/* RSSI accumulated over the valid local steps of the current procedure. */
+static int32_t m_rssi_sum;
+static uint16_t m_rssi_count;
+
+/* ---------------------------------------------------------------------------
+ * CSV export
+ *
+ * One row per (procedure, antenna path, channel with at least one valid tone),
+ * prefixed with "CSV,". The header is prefixed with "CSVH,".
+ * Must match DEFAULT_HEADER in scripts/cs_csv_logger.py.
+ * ------------------------------------------------------------------------- */
+#define CSV_HEADER                                                                                 \
+	"timestamp_ms,ranging_counter,ap,channel,freq_mhz,h_re,h_im,amplitude,phase_deg,n_iqs,"   \
+	"tone_quality,rtt_count,rtt_mean_ns,tof_ns,rssi_dbm,dist_ifft_m,dist_phase_slope_m,"      \
+	"dist_rtt_m"
+
+#define CSV_THREAD_STACK_SIZE 2048
+#define CSV_THREAD_PRIORITY   K_LOWEST_APPLICATION_THREAD_PRIO
+
+struct csv_snapshot {
+	int64_t timestamp_ms;
+	uint16_t ranging_counter;
+	uint8_t n_ap;
+	cs_de_iq_tones_t iq_tones[MAX_AP];
+	uint16_t n_iqs[MAX_AP][CS_DE_NUM_CHANNELS];
+	cs_de_tone_quality_t tone_quality[MAX_AP];
+	cs_de_dist_estimates_t distance_estimates[MAX_AP];
+	int32_t rtt_accumulated_half_ns;
+	uint8_t rtt_count;
+	float rssi_dbm;
+};
+
+static struct csv_snapshot csv_snapshot;
+static atomic_t csv_snapshot_busy;
+static K_SEM_DEFINE(sem_csv_ready, 0, 1);
+static uint32_t csv_skipped_procedures;
 
 static void store_distance_estimates_in_buffer(cs_de_dist_estimates_t *p_estimates,
 					       struct distance_estimate_buffer *buffer)
@@ -262,6 +301,17 @@ static void extract_rtt_timings(cs_de_report_t *p_report,
 	p_report->rtt_count++;
 }
 
+static void accumulate_rssi(uint8_t packet_quality_aa_check, uint8_t packet_rssi)
+{
+	if (packet_quality_aa_check != BT_HCI_LE_CS_PACKET_QUALITY_AA_CHECK_SUCCESSFUL ||
+	    packet_rssi == BT_HCI_LE_CS_PACKET_RSSI_NOT_AVAILABLE) {
+		return;
+	}
+
+	m_rssi_sum += (int8_t)packet_rssi;
+	m_rssi_count++;
+}
+
 static bool process_ranging_header(struct ras_ranging_header *ranging_header, void *user_data)
 {
 	cs_de_report_t *p_report = (cs_de_report_t *)user_data;
@@ -278,7 +328,14 @@ static bool process_step_data(struct bt_le_cs_subevent_step *local_step,
 {
 	cs_de_report_t *p_report = (cs_de_report_t *)user_data;
 
-	if (local_step->mode == BT_HCI_OP_LE_CS_MAIN_MODE_2) {
+	if (local_step->mode == CS_STEP_MODE_0 &&
+	    p_report->role == BT_CONN_LE_CS_ROLE_INITIATOR) {
+		struct bt_hci_le_cs_step_data_mode_0_initiator *local_step_data =
+			(struct bt_hci_le_cs_step_data_mode_0_initiator *)local_step->data;
+
+		accumulate_rssi(local_step_data->packet_quality_aa_check,
+				local_step_data->packet_rssi);
+	} else if (local_step->mode == BT_HCI_OP_LE_CS_MAIN_MODE_2) {
 		struct bt_hci_le_cs_step_data_mode_2 *local_step_data =
 			(struct bt_hci_le_cs_step_data_mode_2 *)local_step->data;
 		struct bt_hci_le_cs_step_data_mode_2 *peer_step_data =
@@ -293,6 +350,8 @@ static bool process_step_data(struct bt_le_cs_subevent_step *local_step,
 		struct bt_hci_le_cs_step_data_mode_1 *peer_step_data =
 			(struct bt_hci_le_cs_step_data_mode_1 *)peer_step->data;
 
+		accumulate_rssi(local_step_data->packet_quality_aa_check,
+				local_step_data->packet_rssi);
 		extract_rtt_timings(p_report, local_step_data, peer_step_data);
 	} else if (local_step->mode == BT_HCI_OP_LE_CS_MAIN_MODE_3) {
 		struct bt_hci_le_cs_step_data_mode_3 *local_step_data =
@@ -304,6 +363,8 @@ static bool process_step_data(struct bt_le_cs_subevent_step *local_step,
 			     local_step_data->antenna_permutation_index, local_step_data->tone_info,
 			     peer_step_data->tone_info);
 
+		accumulate_rssi(local_step_data->packet_quality_aa_check,
+				local_step_data->packet_rssi);
 		extract_rtt_timings(p_report,
 				    (struct bt_hci_le_cs_step_data_mode_1 *)local_step_data,
 				    (struct bt_hci_le_cs_step_data_mode_1 *)peer_step_data);
@@ -311,6 +372,92 @@ static bool process_step_data(struct bt_le_cs_subevent_step *local_step,
 
 	return true;
 }
+
+/* Copies the per-procedure results so they can be printed outside the BT thread. */
+static void csv_snapshot_submit(uint16_t ranging_counter)
+{
+	if (!atomic_cas(&csv_snapshot_busy, 0, 1)) {
+		/* Previous procedure still being printed: skip this one. */
+		csv_skipped_procedures++;
+		return;
+	}
+
+	csv_snapshot.timestamp_ms = k_uptime_get();
+	csv_snapshot.ranging_counter = ranging_counter;
+	csv_snapshot.n_ap = MIN(m_cs_de_report.n_ap, MAX_AP);
+	memcpy(csv_snapshot.iq_tones, m_cs_de_report.iq_tones, sizeof(csv_snapshot.iq_tones));
+	memcpy(csv_snapshot.n_iqs, m_n_iqs, sizeof(csv_snapshot.n_iqs));
+	memcpy(csv_snapshot.tone_quality, m_cs_de_report.tone_quality,
+	       sizeof(csv_snapshot.tone_quality));
+	memcpy(csv_snapshot.distance_estimates, m_cs_de_report.distance_estimates,
+	       sizeof(csv_snapshot.distance_estimates));
+	csv_snapshot.rtt_accumulated_half_ns = m_cs_de_report.rtt_accumulated_half_ns;
+	csv_snapshot.rtt_count = m_cs_de_report.rtt_count;
+	csv_snapshot.rssi_dbm = m_rssi_count ? (float)m_rssi_sum / m_rssi_count : NAN;
+
+	k_sem_give(&sem_csv_ready);
+}
+
+static void csv_snapshot_print(const struct csv_snapshot *snap)
+{
+	/* RTT (and therefore ToF / RTT distance) is computed once per procedure. */
+	float rtt_mean_ns = NAN;
+	float tof_ns = NAN;
+
+	if (snap->rtt_count > 0) {
+		rtt_mean_ns = (snap->rtt_accumulated_half_ns * 0.5f) / snap->rtt_count;
+		tof_ns = rtt_mean_ns / 2.0f;
+	}
+
+	float dist_rtt_m = snap->distance_estimates[0].rtt;
+
+	for (uint8_t ap = 0; ap < snap->n_ap; ap++) {
+		const cs_de_iq_tones_t *iq = &snap->iq_tones[ap];
+		const cs_de_dist_estimates_t *de = &snap->distance_estimates[ap];
+		const char *tq = snap->tone_quality[ap] == CS_DE_TONE_QUALITY_OK ? "OK" : "BAD";
+
+		for (uint8_t i = 0; i < CS_DE_NUM_CHANNELS; i++) {
+			if (snap->n_iqs[ap][i] == 0) {
+				continue;
+			}
+
+			/* Two-way channel response H = local * remote (same as cs_de). */
+			float h_re = iq->i_local[i] * iq->i_remote[i] -
+				     iq->q_local[i] * iq->q_remote[i];
+			float h_im = iq->i_local[i] * iq->q_remote[i] +
+				     iq->i_remote[i] * iq->q_local[i];
+			float amplitude = sqrtf(h_re * h_re + h_im * h_im);
+			float phase_deg = atan2f(h_im, h_re) * (180.0f / 3.14159265f);
+			uint8_t channel = i + CHANNEL_INDEX_OFFSET;
+
+			printk("CSV,%lld,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.2f,%u,%s,%u,%.2f,%.2f,%.1f,"
+			       "%.3f,%.3f,%.3f\n",
+			       snap->timestamp_ms, snap->ranging_counter, ap, channel,
+			       2402 + channel, (double)h_re, (double)h_im, (double)amplitude,
+			       (double)phase_deg, snap->n_iqs[ap][i], tq, snap->rtt_count,
+			       (double)rtt_mean_ns, (double)tof_ns, (double)snap->rssi_dbm,
+			       (double)de->ifft, (double)de->phase_slope, (double)dist_rtt_m);
+		}
+	}
+}
+
+static void csv_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	printk("CSVH," CSV_HEADER "\n");
+
+	while (true) {
+		k_sem_take(&sem_csv_ready, K_FOREVER);
+		csv_snapshot_print(&csv_snapshot);
+		atomic_set(&csv_snapshot_busy, 0);
+	}
+}
+
+K_THREAD_DEFINE(csv_thread_id, CSV_THREAD_STACK_SIZE, csv_thread, NULL, NULL, NULL,
+		CSV_THREAD_PRIORITY, 0, 0);
 
 static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int err)
 {
@@ -347,6 +494,9 @@ static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int 
 
 	memset(&m_cs_de_report, 0x0, sizeof(cs_de_report_t));
 	memset(m_n_iqs, 0, sizeof(m_n_iqs));
+	m_cs_de_report.role = cs_config.role;
+	m_rssi_sum = 0;
+	m_rssi_count = 0;
 
 	bt_ras_rreq_rd_subevent_data_parse(&latest_peer_steps, &latest_local_steps, cs_config.role,
 					   process_ranging_header, NULL, process_step_data,
@@ -374,6 +524,8 @@ static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int 
 	k_sem_give(&sem_local_steps);
 
 	cs_de_quality_t quality = cs_de_calc(&m_cs_de_report);
+
+	csv_snapshot_submit(ranging_counter);
 
 	if (quality == CS_DE_QUALITY_OK) {
 		for (uint8_t ap = 0; ap < m_cs_de_report.n_ap; ap++) {
