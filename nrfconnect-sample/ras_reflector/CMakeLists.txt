@@ -11,5 +11,7 @@ project(ras_reflector)
 # NORDIC SDK APP START
 target_sources(app PRIVATE
   src/main.c
+  src/connection.c
+  src/cs_setup.c
 )
 # NORDIC SDK APP END
