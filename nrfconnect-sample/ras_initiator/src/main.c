@@ -97,14 +97,22 @@ static uint16_t m_rssi_count;
 /* ---------------------------------------------------------------------------
  * CSV export
  *
- * One row per (procedure, antenna path, channel with at least one valid tone),
- * prefixed with "CSV,". The header is prefixed with "CSVH,".
- * Must match DEFAULT_HEADER in scripts/cs_csv_logger.py.
+ * Two record types, so that per-procedure values are not repeated on every
+ * channel row:
+ *  - tones:      one row per (procedure, antenna path, channel with at least
+ *                one valid tone), prefixed with "CSV," (header "CSVH,").
+ *  - procedures: one row per (procedure, antenna path), prefixed with "CSVP,"
+ *                (header "CSVPH,"). Holds everything computed once per
+ *                procedure: tone quality, RTT, ToF, RSSI, distance estimates.
+ * Join the two on (ranging_counter, ap).
+ * Must match TONE_HEADER / PROC_HEADER in scripts/cs_csv_logger.py.
  * ------------------------------------------------------------------------- */
 #define CSV_HEADER                                                                                 \
-	"timestamp_ms,ranging_counter,ap,channel,freq_mhz,h_re,h_im,amplitude,phase_deg,n_iqs,"   \
-	"tone_quality,rtt_count,rtt_mean_ns,tof_ns,rssi_dbm,dist_ifft_m,dist_phase_slope_m,"      \
-	"dist_rtt_m"
+	"timestamp_ms,ranging_counter,ap,channel,freq_mhz,h_re,h_im,amplitude,phase_deg,n_iqs"
+
+#define CSV_PROC_HEADER                                                                            \
+	"timestamp_ms,ranging_counter,ap,tone_quality,rtt_count,rtt_mean_ns,tof_ns,rssi_dbm,"     \
+	"dist_ifft_m,dist_phase_slope_m,dist_rtt_m"
 
 #define CSV_THREAD_STACK_SIZE 2048
 #define CSV_THREAD_PRIORITY   K_LOWEST_APPLICATION_THREAD_PRIO
@@ -416,6 +424,11 @@ static void csv_snapshot_print(const struct csv_snapshot *snap)
 		const cs_de_dist_estimates_t *de = &snap->distance_estimates[ap];
 		const char *tq = snap->tone_quality[ap] == CS_DE_TONE_QUALITY_OK ? "OK" : "BAD";
 
+		printk("CSVP,%lld,%u,%u,%s,%u,%.2f,%.2f,%.1f,%.3f,%.3f,%.3f\n", snap->timestamp_ms,
+		       snap->ranging_counter, ap, tq, snap->rtt_count, (double)rtt_mean_ns,
+		       (double)tof_ns, (double)snap->rssi_dbm, (double)de->ifft,
+		       (double)de->phase_slope, (double)dist_rtt_m);
+
 		for (uint8_t i = 0; i < CS_DE_NUM_CHANNELS; i++) {
 			if (snap->n_iqs[ap][i] == 0) {
 				continue;
@@ -430,13 +443,10 @@ static void csv_snapshot_print(const struct csv_snapshot *snap)
 			float phase_deg = atan2f(h_im, h_re) * (180.0f / 3.14159265f);
 			uint8_t channel = i + CHANNEL_INDEX_OFFSET;
 
-			printk("CSV,%lld,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.2f,%u,%s,%u,%.2f,%.2f,%.1f,"
-			       "%.3f,%.3f,%.3f\n",
-			       snap->timestamp_ms, snap->ranging_counter, ap, channel,
-			       2402 + channel, (double)h_re, (double)h_im, (double)amplitude,
-			       (double)phase_deg, snap->n_iqs[ap][i], tq, snap->rtt_count,
-			       (double)rtt_mean_ns, (double)tof_ns, (double)snap->rssi_dbm,
-			       (double)de->ifft, (double)de->phase_slope, (double)dist_rtt_m);
+			printk("CSV,%lld,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.2f,%u\n", snap->timestamp_ms,
+			       snap->ranging_counter, ap, channel, 2402 + channel, (double)h_re,
+			       (double)h_im, (double)amplitude, (double)phase_deg,
+			       snap->n_iqs[ap][i]);
 		}
 	}
 }
@@ -448,6 +458,7 @@ static void csv_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	printk("CSVH," CSV_HEADER "\n");
+	printk("CSVPH," CSV_PROC_HEADER "\n");
 
 	while (true) {
 		k_sem_take(&sem_csv_ready, K_FOREVER);
