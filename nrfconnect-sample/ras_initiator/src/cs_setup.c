@@ -215,6 +215,48 @@ static void cs_config_get(struct bt_le_cs_create_config_params *config_params)
 	config_params->ch3c_jump = 2;
 }
 
+#define CS_CHMAP_MIN_CHANNELS 15
+
+BUILD_ASSERT(CONFIG_SAMPLE_RAS_INITIATOR_CH_MIN <= CONFIG_SAMPLE_RAS_INITIATOR_CH_MAX,
+	     "CH_MIN must be <= CH_MAX");
+
+/* Restrict the spec-valid channel map to [CH_MIN, CH_MAX], one channel every CH_STEP. */
+static int cs_chmap_apply_selection(uint8_t *chmap)
+{
+	uint8_t n_channels = 0;
+	uint8_t first = 0;
+	uint8_t last = 0;
+
+	for (uint8_t ch = 0; ch < 80; ch++) {
+		bool keep = BT_LE_CS_CHANNEL_BIT_GET(chmap, ch) &&
+			    ch >= CONFIG_SAMPLE_RAS_INITIATOR_CH_MIN &&
+			    ch <= CONFIG_SAMPLE_RAS_INITIATOR_CH_MAX &&
+			    ((ch - CONFIG_SAMPLE_RAS_INITIATOR_CH_MIN) %
+			     CONFIG_SAMPLE_RAS_INITIATOR_CH_STEP) == 0;
+
+		BT_LE_CS_CHANNEL_BIT_SET_VAL(chmap, ch, keep ? 1 : 0);
+
+		if (keep) {
+			if (n_channels == 0) {
+				first = ch;
+			}
+			last = ch;
+			n_channels++;
+		}
+	}
+
+	if (n_channels < CS_CHMAP_MIN_CHANNELS) {
+		LOG_ERR("Channel map has %u channels, at least %u required", n_channels,
+			CS_CHMAP_MIN_CHANNELS);
+		return -EINVAL;
+	}
+
+	LOG_INF("Channel map: %u channels, ch %u-%u (%u-%u MHz), span %u MHz, step %u MHz",
+		n_channels, first, last, 2402 + first, 2402 + last, last - first,
+		CONFIG_SAMPLE_RAS_INITIATOR_CH_STEP);
+	return 0;
+}
+
 int cs_setup_create_config(struct bt_conn *conn)
 {
 	struct bt_le_cs_create_config_params config_params;
@@ -223,8 +265,26 @@ int cs_setup_create_config(struct bt_conn *conn)
 
 	bt_le_cs_set_valid_chmap_bits(config_params.channel_map);
 
+	int ret = cs_chmap_apply_selection(config_params.channel_map);
+
+	if (ret) {
+		return ret;
+	}
+	
+	//
+	/** 
+	for(uint8_t ch = 0; ch<80; ch++){
+		if (ch%2)
+		{
+			BT_LE_CS_CHANNEL_BIT_SET_VAL(config_params.channel_map, ch, 0);
+		}
+		
+	}
+	*/
+
 	int err = bt_le_cs_create_config(conn, &config_params,
 					 BT_LE_CS_CREATE_CONFIG_CONTEXT_LOCAL_AND_REMOTE);
+
 	if (err) {
 		LOG_ERR("Failed to create CS config (err %d)", err);
 		return err;

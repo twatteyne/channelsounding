@@ -38,6 +38,34 @@ config SAMPLE_RAS_INITIATOR_STEP_MODE_3
 
 endchoice
 
+menu "Channel map selection"
+
+config SAMPLE_RAS_INITIATOR_CH_MIN
+	int "Lowest CS channel used"
+	range 2 76
+	default 2
+	help
+	  Lowest CS channel index (frequency = 2402 + channel MHz) kept in the
+	  channel map. Together with CH_MAX it sets the frequency span.
+
+config SAMPLE_RAS_INITIATOR_CH_MAX
+	int "Highest CS channel used"
+	range 2 76
+	default 76
+	help
+	  Highest CS channel index kept in the channel map.
+
+config SAMPLE_RAS_INITIATOR_CH_STEP
+	int "Keep one channel every N"
+	range 1 36
+	default 1
+	help
+	  Keep channels CH_MIN, CH_MIN + N, CH_MIN + 2N, ... up to CH_MAX.
+	  Channels forbidden by the spec (23-25) are always excluded.
+	  The resulting map must contain at least 15 channels.
+
+endmenu
+
 endmenu
 
 source "Kconfig.zephyr"
