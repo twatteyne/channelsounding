@@ -6,12 +6,10 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(ras_reflector)
+project(channel_sounding_ras_reflector)
 
 # NORDIC SDK APP START
 target_sources(app PRIVATE
   src/main.c
-  src/connection.c
-  src/cs_setup.c
 )
 # NORDIC SDK APP END

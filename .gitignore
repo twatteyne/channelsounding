@@ -2,3 +2,5 @@
 build
 .idea
 .env
+data/
+__pycache__/
