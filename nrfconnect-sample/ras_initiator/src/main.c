@@ -33,6 +33,11 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define REFLECTOR_NAME "Nordic CS Reflector"
 #define CS_CONFIG_ID 0
 
+
+#define CS_CHANNEL_MAP_SIZE 10
+#define MAX_CS_CHANNELS 80
+#define TEST_CHANNEL_COUNT 30
+
 #if defined(CONFIG_SAMPLE_RAS_INITIATOR_STEP_MODE_2_SUB_MODE_1)
 #define CS_CONFIG_MODE BT_CONN_LE_CS_MAIN_MODE_2_SUB_MODE_1
 #elif defined(CONFIG_SAMPLE_RAS_INITIATOR_STEP_MODE_2)
@@ -833,6 +838,49 @@ static void distance_estimates_print(uint8_t ap)
 #endif
 }
 
+
+
+static bool configure_channel_map(uint8_t channel_map[CS_CHANNEL_MAP_SIZE],
+                                  uint8_t requested_channels)
+{
+    uint8_t valid_map[CS_CHANNEL_MAP_SIZE] = {0};
+    uint8_t valid_channels[MAX_CS_CHANNELS];
+    uint8_t valid_count = 0;
+
+    /* Récupérer tous les canaux autorisés */
+    bt_le_cs_set_valid_chmap_bits(valid_map);
+
+    for (uint8_t ch = 0; ch < MAX_CS_CHANNELS; ch++) {
+        if (BT_LE_CS_CHANNEL_BIT_GET(valid_map, ch)) {
+            valid_channels[valid_count++] = ch;
+        }
+    }
+
+    if (requested_channels == 0 ||
+        requested_channels > valid_count) {
+        LOG_ERR("Nombre de canaux invalide : %u", requested_channels);
+        return false;
+    }
+
+    /* Réinitialiser la Channel Map */
+    memset(channel_map, 0, CS_CHANNEL_MAP_SIZE);
+
+    /* Sélectionner uniformément les canaux autorisés */
+    for (uint8_t i = 0; i < requested_channels; i++) {
+        uint8_t index = (i * valid_count) / requested_channels;
+        uint8_t ch = valid_channels[index];
+
+        BT_LE_CS_CHANNEL_BIT_SET_VAL(channel_map, ch, 1);
+    }
+
+    LOG_INF("%u canaux sélectionnés sur %u disponibles",
+            requested_channels, valid_count);
+
+    return true;
+}
+
+
+
 int main(void)
 {
 	int err;
@@ -958,7 +1006,12 @@ int main(void)
 
 	cs_config_get(&config_params);
 
-	bt_le_cs_set_valid_chmap_bits(config_params.channel_map);
+
+	if (!configure_channel_map(config_params.channel_map,
+							TEST_CHANNEL_COUNT)) {
+		LOG_ERR("Impossible de configurer la Channel Map");
+		return 0;
+	}
 
 	err = bt_le_cs_create_config(connection, &config_params,
 				     BT_LE_CS_CREATE_CONFIG_CONTEXT_LOCAL_AND_REMOTE);
