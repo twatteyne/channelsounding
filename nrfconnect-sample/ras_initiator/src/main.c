@@ -36,7 +36,7 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 #define CS_CHANNEL_MAP_SIZE 10
 #define MAX_CS_CHANNELS 80
-#define TEST_CHANNEL_COUNT 30
+#define TEST_CHANNEL_COUNT 72
 
 #if defined(CONFIG_SAMPLE_RAS_INITIATOR_STEP_MODE_2_SUB_MODE_1)
 #define CS_CONFIG_MODE BT_CONN_LE_CS_MAIN_MODE_2_SUB_MODE_1
@@ -52,7 +52,7 @@ BUILD_ASSERT(false, "Invalid ranging mode");
 
 #define NUM_MODE_0_STEPS       3
 #define PROCEDURE_COUNTER_NONE (-1)
-#define DE_SLIDING_WINDOW_SIZE (9)
+#define DE_SLIDING_WINDOW_SIZE (20)
 #define MAX_AP		       (CONFIG_BT_RAS_MAX_ANTENNA_PATHS)
 
 #define LOCAL_PROCEDURE_MEM                                                                        \
@@ -211,17 +211,26 @@ static void extract_pcts(cs_de_report_t *p_report, uint8_t channel_index,
 			return;
 		}
 
+		struct bt_le_cs_iq_sample local_iq =
+			bt_le_cs_parse_pct(local_tone_info[tone_index].phase_correction_term);
+		struct bt_le_cs_iq_sample remote_iq =
+			bt_le_cs_parse_pct(remote_tone_info[tone_index].phase_correction_term);
+
+		/* CSV row, cell format matches scripts/data/*.csv:
+		 * initiator_quality;reflector_quality;channel;antenna;
+		 * initiator_I;initiator_Q;reflector_I;reflector_Q */
+		printk("CSV,%u;%u;%u;%u;%d;%d;%d;%d\n",
+		       local_tone_info[tone_index].quality_indicator,
+		       remote_tone_info[tone_index].quality_indicator,
+		       channel_index + CHANNEL_INDEX_OFFSET, (uint8_t)antenna_path,
+		       local_iq.i, local_iq.q, remote_iq.i, remote_iq.q);
+
 		if (local_tone_info[tone_index].quality_indicator !=
 			    BT_HCI_LE_CS_TONE_QUALITY_HIGH ||
 		    remote_tone_info[tone_index].quality_indicator !=
 			    BT_HCI_LE_CS_TONE_QUALITY_HIGH) {
 			return;
 		}
-
-		struct bt_le_cs_iq_sample local_iq =
-			bt_le_cs_parse_pct(local_tone_info[tone_index].phase_correction_term);
-		struct bt_le_cs_iq_sample remote_iq =
-			bt_le_cs_parse_pct(remote_tone_info[tone_index].phase_correction_term);
 
 		m_n_iqs[antenna_path][channel_index]++;
 
